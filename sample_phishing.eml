@@ -1,0 +1,41 @@
+From: "IT Support" <it-support@secure-company.com>
+To: "john.doe@aya-bank.com" <john.doe@aya-bank.com>
+Cc: "security-team@aya-bank.com" <security-team@aya-bank.com>
+Reply-To: "it-support@secure-c0mpany.com" <it-support@secure-c0mpany.com>
+Subject: Urgent: Your account will be suspended - Verify now
+Date: Thu, 21 Aug 2025 09:15:30 +0630
+Message-ID: <abc123xyz@malicious-server.ru>
+Return-Path: <bounce@phishing-domain.xyz>
+X-Mailer: PHPMailer 6.0.2
+X-Originating-IP: [185.220.101.34]
+MIME-Version: 1.0
+Content-Type: text/html; charset="UTF-8"
+Authentication-Results: mx.aya-bank.com;
+    spf=fail (domain of secure-company.com does not designate 185.220.101.34 as permitted sender);
+    dkim=fail (signature verification failed);
+    dmarc=fail (policy=reject) header.from=secure-company.com
+Received-SPF: fail (domain of secure-company.com does not designate 185.220.101.34 as permitted sender) client-ip=185.220.101.34; envelope-from=bounce@phishing-domain.xyz
+DKIM-Signature: v=1; a=rsa-sha256; d=secure-company.com; s=selector1; h=from:to:subject:date:message-id; bh=abc123=; b=fakesignature=
+Received: from malicious-server.ru (unknown [185.220.101.34])
+    by mx.aya-bank.com with ESMTP id xyz789
+    for <john.doe@aya-bank.com>;
+    Thu, 21 Aug 2025 09:15:30 +0630
+Received: from internal-relay.phishing.ru ([10.0.1.50])
+    by malicious-server.ru with ESMTPS id abc456
+    for <john.doe@aya-bank.com>;
+    Thu, 21 Aug 2025 09:14:55 +0630
+Received: from compromised-host.darknet.cc ([91.215.85.142])
+    by internal-relay.phishing.ru with SMTP id def789
+    for <john.doe@aya-bank.com>;
+    Thu, 21 Aug 2025 09:12:10 +0630
+
+<html>
+<body>
+<h1>Your Account Has Been Compromised!</h1>
+<p>Dear User,</p>
+<p>We detected unusual activity on your account. Click below to verify:</p>
+<a href="http://185.220.101.34/verify.php?id=aya-bank-john">Verify Your Account Now</a>
+<p>Or visit: http://phishing-domain.xyz/secure-login/verify</p>
+<p>This link expires in 24 hours.</p>
+</body>
+</html>
