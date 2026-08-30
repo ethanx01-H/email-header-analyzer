@@ -73,6 +73,10 @@ Examples:
     parser.add_argument("--export", metavar="PREFIX", help="Save report to file (prefix)")
     parser.add_argument("--no-color", action="store_true", help="Disable colored output")
     parser.add_argument("--setup", action="store_true", help="Configure API keys interactively")
+    parser.add_argument("--batch", metavar="DIR", help="Analyze all .eml files in directory")
+    parser.add_argument("--sigma", action="store_true", help="Generate Sigma detection rules")
+    parser.add_argument("--stix", metavar="FILE", help="Export IOCs as STIX 2.1 bundle")
+    parser.add_argument("--html", metavar="FILE", help="Generate HTML report")
 
     args = parser.parse_args()
 
@@ -83,6 +87,11 @@ Examples:
     if args.setup:
         from config import setup_wizard
         setup_wizard()
+        return
+
+    # Batch processing
+    if args.batch:
+        _batch_process(args)
         return
 
     # Validate file
@@ -181,6 +190,22 @@ def _full_analysis(headers: dict, args):
         print(f"  {C.BG_RED}{C.WHITE}{C.BOLD} WARNING {C.RESET} {C.RED}Domain mismatch: "
               f"From domain ({iocs['sender_domain']}) != Return-Path ({iocs['return_path_domain']}){C.RESET}")
 
+    # Homoglyph/lookalike warnings
+    homoglyph_findings = iocs.get("homoglyph_findings", [])
+    if homoglyph_findings:
+        print()
+        for hf in homoglyph_findings:
+            sev = hf.get("severity", "MEDIUM")
+            sc = _sev_color(sev)
+            print(f"  {sc}[{sev}]{C.RESET} {C.BOLD}Homoglyph:{C.RESET} {hf.get('detail', '')}")
+
+    # Forwarded email indicator
+    is_forwarded = headers.get("is_forwarded", {})
+    if is_forwarded.get("is_forwarded"):
+        print()
+        print(f"  {C.YELLOW}[FORWARDED]{C.RESET} Email was forwarded — "
+              f"indicators: {', '.join(is_forwarded.get('indicators', []))}")
+
     # Attachments
     atts = headers.get("attachments", [])
     if atts:
@@ -189,6 +214,10 @@ def _full_analysis(headers: dict, args):
         for att in atts:
             size_kb = att["size_bytes"] / 1024
             print(f"    {C.DIM}├─{C.RESET} {att['filename']} ({att['content_type']}, {size_kb:.1f} KB)")
+            if att.get("sha256"):
+                print(f"    {C.DIM}│  SHA256: {att['sha256']}{C.RESET}")
+            if att.get("md5"):
+                print(f"    {C.DIM}│  MD5:    {att['md5']}{C.RESET}")
 
     # Risk Score
     print()
@@ -232,6 +261,36 @@ def _full_analysis(headers: dict, args):
     if args.export:
         _export_report(headers, iocs, auth, hops, risk, args.export)
 
+    # Sigma rule generation
+    if args.sigma:
+        from sigma_generator import generate_sigma_rules, export_sigma_rules
+        sigma_rules = generate_sigma_rules(headers, iocs, auth, risk)
+        if sigma_rules:
+            exported = export_sigma_rules(sigma_rules)
+            print(f"\n  {C.GREEN}✓{C.RESET} Generated {len(sigma_rules)} Sigma rule(s):")
+            for f in exported:
+                print(f"    {C.DIM}• {f}{C.RESET}")
+        else:
+            print(f"\n  {C.DIM}No Sigma rules generated (no actionable findings){C.RESET}")
+
+    # STIX export
+    if args.stix:
+        from stix_export import generate_stix_bundle, export_stix_bundle, generate_stix_summary
+        stix_bundle = generate_stix_bundle(headers, iocs, auth, risk, enrichment)
+        export_stix_bundle(stix_bundle, args.stix)
+        summary = generate_stix_summary(stix_bundle)
+        print(f"\n  {C.GREEN}✓{C.RESET} STIX 2.1 bundle exported to: {C.BOLD}{args.stix}{C.RESET}")
+        print(f"    {C.DIM}{summary['total_objects']} objects: "
+              f"{summary['indicators']} indicators, "
+              f"{summary['attack_patterns']} attack patterns{C.RESET}")
+
+    # HTML report
+    if args.html:
+        from html_report import generate_html_report, export_html_report
+        html_content = generate_html_report(headers, iocs, auth, hops, risk, enrichment)
+        export_html_report(html_content, args.html)
+        print(f"\n  {C.GREEN}✓{C.RESET} HTML report exported to: {C.BOLD}{args.html}{C.RESET}")
+
 
 # ──────────────────────────────────────────────
 #  SECTION PRINTERS
@@ -273,7 +332,7 @@ def _print_risk_score(risk: dict):
     }
     lc = level_colors.get(level, C.WHITE)
 
-    # Score bar
+    # Score bar (capped at 100 for display)
     bar_len = min(score, 100)
     filled = "█" * (bar_len // 2)
     empty = "░" * (50 - bar_len // 2)
@@ -750,24 +809,114 @@ def _fmt_duration(seconds) -> str:
 
 
 def _is_private(ip: str) -> bool:
-    try:
-        parts = ip.split(".")
-        if len(parts) != 4:
-            return False
-        a, b = int(parts[0]), int(parts[1])
-        if a == 10:
-            return True
-        if a == 127:
-            return True
-        if a == 172 and 16 <= b <= 31:
-            return True
-        if a == 192 and b == 168:
-            return True
-        if a == 169 and b == 254:
-            return True
-        return False
-    except (ValueError, IndexError):
-        return False
+    """Check if IP is private. Delegates to ioc_extractor."""
+    from ioc_extractor import _is_private_ip
+    return _is_private_ip(ip)
+
+
+def _batch_process(args):
+    """Process all .eml files in a directory."""
+    import glob
+
+    directory = args.batch
+    if not os.path.isdir(directory):
+        print(f"{C.RED}[ERROR]{C.RESET} Directory not found: {directory}")
+        sys.exit(1)
+
+    eml_files = glob.glob(os.path.join(directory, "*.eml"))
+    if not eml_files:
+        print(f"{C.YELLOW}[WARN]{C.RESET} No .eml files found in: {directory}")
+        return
+
+    print(f"\n  {C.CYAN}{C.BOLD}Batch Processing{C.RESET}")
+    print(f"  {C.DIM}Found {len(eml_files)} .eml file(s) in {directory}{C.RESET}")
+    print()
+
+    # Import analysis modules
+    from header_parser import parse_eml
+    from ioc_extractor import extract_all_iocs
+    from auth_checker import analyze_authentication
+    from hop_tracer import trace_hops
+    from risk_scorer import calculate_risk
+
+    results = []
+    for i, eml_file in enumerate(eml_files, 1):
+        filename = os.path.basename(eml_file)
+        print(f"  [{i}/{len(eml_files)}] {C.BOLD}{filename}{C.RESET}")
+
+        try:
+            headers = parse_eml(eml_file)
+            iocs = extract_all_iocs(headers)
+            auth = analyze_authentication(headers)
+            hops = trace_hops(headers)
+            risk = calculate_risk(auth, iocs, hops, headers)
+
+            results.append({
+                "file": filename,
+                "subject": headers.get("subject", "(empty)"),
+                "from": headers.get("from", "(empty)"),
+                "risk_level": risk["risk_level"],
+                "risk_score": risk["total_score"],
+                "signal_count": risk["signal_count"],
+                "strong_signals": len(risk.get("strong_signals", [])),
+            })
+
+            # Color by risk level
+            level_color = {
+                "CRITICAL": C.RED,
+                "HIGH": C.RED,
+                "MEDIUM": C.YELLOW,
+                "LOW": C.CYAN,
+                "BENIGN": C.GREEN,
+            }.get(risk["risk_level"], C.WHITE)
+
+            print(f"         Risk: {level_color}{risk['risk_level']} ({risk['total_score']}){C.RESET} | "
+                  f"Signals: {risk['signal_count']} | "
+                  f"Subject: {headers.get('subject', '(empty)')[:50]}")
+
+        except Exception as e:
+            print(f"         {C.RED}ERROR: {e}{C.RESET}")
+            results.append({
+                "file": filename,
+                "error": str(e),
+            })
+
+    # Summary
+    print()
+    _print_divider()
+    print(f"  {C.BOLD}Batch Summary{C.RESET}")
+    print(f"  {C.DIM}Total: {len(results)} file(s){C.RESET}")
+
+    # Count by risk level
+    risk_counts = {}
+    for r in results:
+        level = r.get("risk_level", "ERROR")
+        risk_counts[level] = risk_counts.get(level, 0) + 1
+
+    for level in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "BENIGN"]:
+        count = risk_counts.get(level, 0)
+        if count > 0:
+            level_color = {
+                "CRITICAL": C.RED,
+                "HIGH": C.RED,
+                "MEDIUM": C.YELLOW,
+                "LOW": C.CYAN,
+                "BENIGN": C.GREEN,
+            }.get(level, C.WHITE)
+            print(f"    {level_color}{level}: {count}{C.RESET}")
+
+    if risk_counts.get("ERROR", 0) > 0:
+        print(f"    {C.RED}ERROR: {risk_counts['ERROR']}{C.RESET}")
+
+    # Export batch results if requested
+    if args.export:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{args.export}_batch_{ts}.json"
+        with open(filename, "w") as f:
+            json.dump(results, f, indent=2, default=str)
+        print(f"\n  {C.GREEN}✓{C.RESET} Batch results saved to: {C.BOLD}{filename}{C.RESET}")
+
+    print()
 
 
 if __name__ == "__main__":

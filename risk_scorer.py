@@ -132,6 +132,28 @@ def calculate_risk(auth: dict, iocs: dict, hops: dict, headers: dict, enrichment
             "detail": f"From: {from_parsed['address']} vs Reply-To: {reply_to_parsed['address']}",
         })
 
+    # --- Homoglyph / lookalike domain signals ---
+    for finding in iocs.get("homoglyph_findings", []):
+        sev = finding.get("severity", "MEDIUM")
+        signals.append({
+            "tier": TIER_STRONG if sev == "CRITICAL" else TIER_MODERATE,
+            "severity": sev,
+            "score": SEVERITY_SCORES.get(sev, 15),
+            "finding": f"Homoglyph: {finding.get('type', 'unknown')}",
+            "detail": finding.get("detail", ""),
+        })
+
+    # --- Forwarded email signal ---
+    is_forwarded = headers.get("is_forwarded", {})
+    if is_forwarded.get("is_forwarded"):
+        signals.append({
+            "tier": TIER_WEAK,
+            "severity": "LOW",
+            "score": 3,
+            "finding": "Forwarded email",
+            "detail": f"Indicators: {', '.join(is_forwarded.get('indicators', []))}",
+        })
+
     # Check for suspicious X-Mailer
     x_mailer = headers.get("x_mailer", "")
     if x_mailer:

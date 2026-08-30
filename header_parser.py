@@ -6,6 +6,7 @@ Parse .eml files and extract all email headers.
 import email
 import email.policy
 import email.utils
+import hashlib
 from email.message import EmailMessage
 from datetime import datetime
 from typing import Optional
@@ -58,6 +59,13 @@ def parse_eml(file_path: str) -> dict:
     headers["return_path_parsed"] = _parse_email_address(headers["return_path"])
     headers["date_parsed"] = _parse_date(headers["date"])
 
+    # Forwarded email detection
+    headers["is_forwarded"] = _detect_forwarded(headers)
+
+    # Full body extraction (not just preview)
+    headers["body_text"] = _get_body_text(msg, max_len=5000)
+    headers["body_html"] = _get_body_html(msg, max_len=10000)
+
     return headers
 
 
@@ -102,19 +110,27 @@ def _get_body_preview(msg: EmailMessage, max_len: int = 500) -> str:
 
 
 def _get_attachment_info(msg: EmailMessage) -> list:
-    """Get attachment metadata without extracting content."""
+    """Get attachment metadata including SHA256 hash."""
     attachments = []
     if msg.is_multipart():
         for part in msg.walk():
             cd = str(part.get("Content-Disposition", ""))
             if "attachment" in cd:
                 filename = part.get_filename() or "unnamed"
-                size = len(part.get_payload(decode=True) or b"")
+                raw_content = part.get_payload(decode=True) or b""
+                size = len(raw_content)
                 ct = part.get_content_type()
+
+                # Compute hashes
+                md5 = hashlib.md5(raw_content).hexdigest() if raw_content else ""
+                sha256 = hashlib.sha256(raw_content).hexdigest() if raw_content else ""
+
                 attachments.append({
                     "filename": filename,
                     "content_type": ct,
                     "size_bytes": size,
+                    "md5": md5,
+                    "sha256": sha256,
                 })
     return attachments
 
@@ -144,3 +160,79 @@ def _parse_date(raw: str) -> Optional[str]:
         return dt.isoformat()
     except Exception:
         return raw
+
+
+def _detect_forwarded(headers: dict) -> dict:
+    """Detect if email was forwarded."""
+    indicators = []
+
+    # Check for Forwarded header
+    all_headers = headers.get("all_headers", {})
+    for h_name in ["Forwarded", "X-Forwarded-For", "X-Forwarded-To",
+                    "Resent-From", "Resent-To", "Resent-Date", "Resent-Message-ID"]:
+        if h_name in all_headers:
+            indicators.append(h_name)
+
+    # Check subject for FWD:/FW: prefix
+    subject = headers.get("subject", "")
+    if re.match(r'^(FWD?|FW)\s*:', subject, re.IGNORECASE):
+        indicators.append("Subject prefix (FWD:/FW:)")
+
+    # Check body for forwarded message markers
+    body = headers.get("body_preview", "")
+    forwarded_markers = [
+        "---------- Forwarded message",
+        "Begin forwarded message",
+        "Original Message",
+        "-----Original Message-----",
+        "From:",  # In body context, indicates forwarded content
+    ]
+    for marker in forwarded_markers:
+        if marker.lower() in body.lower():
+            indicators.append(f"Body marker: {marker}")
+            break
+
+    return {
+        "is_forwarded": len(indicators) > 0,
+        "indicators": indicators,
+    }
+
+
+def _get_body_text(msg: EmailMessage, max_len: int = 5000) -> str:
+    """Get full plain text body."""
+    try:
+        if msg.is_multipart():
+            for part in msg.walk():
+                ct = part.get_content_type()
+                if ct == "text/plain":
+                    payload = part.get_content()
+                    if isinstance(payload, str):
+                        return payload[:max_len]
+        else:
+            if msg.get_content_type() == "text/plain":
+                payload = msg.get_content()
+                if isinstance(payload, str):
+                    return payload[:max_len]
+    except Exception:
+        pass
+    return ""
+
+
+def _get_body_html(msg: EmailMessage, max_len: int = 10000) -> str:
+    """Get full HTML body."""
+    try:
+        if msg.is_multipart():
+            for part in msg.walk():
+                ct = part.get_content_type()
+                if ct == "text/html":
+                    payload = part.get_content()
+                    if isinstance(payload, str):
+                        return payload[:max_len]
+        else:
+            if msg.get_content_type() == "text/html":
+                payload = msg.get_content()
+                if isinstance(payload, str):
+                    return payload[:max_len]
+    except Exception:
+        pass
+    return ""

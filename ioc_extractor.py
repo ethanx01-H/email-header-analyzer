@@ -4,7 +4,8 @@ IPs, domains, URLs, email addresses, suspicious patterns.
 """
 
 import re
-from typing import Set
+import unicodedata
+from typing import Set, List, Tuple
 
 
 # Regex patterns
@@ -23,9 +24,7 @@ IPV6_PATTERN = re.compile(
 
 DOMAIN_PATTERN = re.compile(
     r'\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+'
-    r'(?:com|net|org|io|co|info|biz|xyz|top|club|online|site|tech|'
-    r'store|app|dev|cloud|me|us|uk|de|fr|ru|cn|br|in|au|jp|kr|sg|'
-    r'mm|my|th|vn|ph|id|kh|la|bd|pk|lk|np|tw|hk|mo)\b'
+    r'[a-zA-Z]{2,}\b'
 )
 
 EMAIL_PATTERN = re.compile(
@@ -98,6 +97,9 @@ def extract_all_iocs(headers: dict) -> dict:
         if len(parts) == 2:
             return_path_domain = parts[1]
 
+    # Homoglyph/lookalike domain analysis
+    homoglyph_findings = analyze_sender_domain(headers)
+
     return {
         "ips": sorted(ips),
         "public_ips": sorted(public_ips),
@@ -108,6 +110,7 @@ def extract_all_iocs(headers: dict) -> dict:
         "sender_domain": sender_domain,
         "return_path_domain": return_path_domain,
         "domain_mismatch": sender_domain != return_path_domain and return_path_domain != "",
+        "homoglyph_findings": homoglyph_findings,
     }
 
 
@@ -145,11 +148,36 @@ def extract_emails(text: str) -> Set[str]:
 
 
 def extract_urls(text: str) -> Set[str]:
-    """Extract URLs from text."""
+    """Extract URLs from text, including deobfuscated variants."""
     urls = set()
+
+    # Standard URL extraction
     for match in URL_PATTERN.finditer(text):
         url = match.group().rstrip(".,;:!?)")
         urls.add(url)
+
+    # Deobfuscate hxxp -> http
+    deobfuscated = re.sub(r'hxxps?://', lambda m: 'https://' if 'hxxps' in m.group() else 'http://', text, flags=re.IGNORECASE)
+    for match in URL_PATTERN.finditer(deobfuscated):
+        url = match.group().rstrip(".,;:!?)")
+        urls.add(url)
+
+    # Deobfuscate [.] -> .
+    deobfuscated2 = re.sub(r'\[\.\]', '.', text)
+    for match in URL_PATTERN.finditer(deobfuscated2):
+        url = match.group().rstrip(".,;:!?)")
+        urls.add(url)
+
+    # Deobfuscate URL encoding
+    try:
+        import urllib.parse
+        decoded = urllib.parse.unquote(text)
+        for match in URL_PATTERN.finditer(decoded):
+            url = match.group().rstrip(".,;:!?)")
+            urls.add(url)
+    except Exception:
+        pass
+
     return urls
 
 
@@ -166,3 +194,173 @@ def _is_private_ip(ip: str) -> bool:
         return False
     except (ValueError, IndexError):
         return False
+
+
+# ──────────────────────────────────────────────
+#  HOMOGLYPH / LOOKALIKE DOMAIN DETECTION
+# ──────────────────────────────────────────────
+
+# Common homoglyph substitutions (Cyrillic, Greek, etc.)
+HOMOGLYPH_MAP = {
+    'a': ['а', 'ɑ', 'α'],  # Cyrillic а, Latin ɑ, Greek α
+    'c': ['с', 'ϲ'],  # Cyrillic с, Greek ϲ
+    'e': ['е', 'ε'],  # Cyrillic е, Greek ε
+    'o': ['о', 'ο', '0'],  # Cyrillic о, Greek ο, zero
+    'p': ['р', 'ρ'],  # Cyrillic р, Greek ρ
+    'x': ['х', 'χ'],  # Cyrillic х, Greek χ
+    'y': ['у', 'γ'],  # Cyrillic у, Greek γ
+    'i': ['і', 'ι', '1', 'l', '1'],  # Ukrainian і, Greek ι, one, l
+    'l': ['1', 'I', 'і'],  # one, capital I, Ukrainian і
+    's': ['ѕ', 'ꜱ'],  # Cyrillic ѕ
+    'n': ['ո', 'η'],  # Armenian ո, Greek η
+    'd': ['ԁ', 'ɗ'],  # Cyrillic ԁ
+    'g': ['ɡ', 'ǥ'],  # Latin ɡ
+    'h': ['һ', 'ℎ'],  # Cyrillic һ
+    'k': ['κ', 'ĸ'],  # Greek κ
+    'm': ['ⅿ', 'rn'],  # Roman numeral, r+n combo
+    'w': ['ѡ', 'ω'],  # Cyrillic ѡ, Greek ω
+    '0': ['o', 'O', 'о'],  # zero -> o
+    '1': ['l', 'I', 'і'],  # one -> l, I
+}
+
+# Common lookalike domain patterns (typosquatting)
+LOOKALIKE_PATTERNS = [
+    # Common brand typos
+    (r'g[o0][o0]gle', 'google'),
+    (r'micr[o0]s[o0]ft', 'microsoft'),
+    (r'amaz[o0]n', 'amazon'),
+    (r'payp[aа]l', 'paypal'),
+    (r'apple\.c[o0]m', 'apple.com'),
+    (r'faceb[o0][o0]k', 'facebook'),
+    (r'netfl[i1]x', 'netflix'),
+    (r'gma[i1]l', 'gmail'),
+    (r'yah[o0][o0]', 'yahoo'),
+    (r'outl[o0][o0]k', 'outlook'),
+    (r'secure-c[o0]mpany', 'secure-company'),
+]
+
+
+def detect_homoglyphs(domain: str) -> List[dict]:
+    """Detect homoglyph/lookalike domain attacks."""
+    findings = []
+    domain_lower = domain.lower()
+
+    # Check for mixed-script characters
+    has_cyrillic = any('Ѐ' <= c <= 'ӿ' for c in domain)
+    has_greek = any('Ͱ' <= c <= 'Ͽ' for c in domain)
+    has_latin = any('a' <= c <= 'z' for c in domain_lower)
+
+    if (has_cyrillic or has_greek) and has_latin:
+        findings.append({
+            "type": "mixed_script",
+            "severity": "CRITICAL",
+            "detail": f"Mixed-script domain detected: {domain} (possible IDN homograph attack)",
+        })
+
+    # Check for numeric substitution (0 for o, 1 for l, etc.)
+    numeric_substitutions = []
+    for i, c in enumerate(domain_lower):
+        if c in ('0', '1'):
+            # Check if replacing with letter makes a known domain
+            replacement = 'o' if c == '0' else 'l'
+            test_domain = domain_lower[:i] + replacement + domain_lower[i+1:]
+            # Check against common domains
+            common_domains = ['google', 'microsoft', 'amazon', 'paypal', 'apple',
+                            'facebook', 'netflix', 'gmail', 'yahoo', 'outlook',
+                            'company', 'secure', 'bank', 'login', 'verify']
+            for cd in common_domains:
+                if cd in test_domain and cd not in domain_lower:
+                    numeric_substitutions.append((i, c, replacement, cd))
+
+    if numeric_substitutions:
+        findings.append({
+            "type": "numeric_substitution",
+            "severity": "HIGH",
+            "detail": f"Numeric substitution detected: {domain} (possible typosquatting)",
+            "substitutions": numeric_substitutions,
+        })
+
+    # Check for lookalike patterns
+    for pattern, target in LOOKALIKE_PATTERNS:
+        if re.search(pattern, domain_lower):
+            findings.append({
+                "type": "lookalike_pattern",
+                "severity": "HIGH",
+                "detail": f"Lookalike pattern detected: {domain} resembles {target}",
+            })
+
+    # Check for suspicious TLDs
+    suspicious_tlds = ['.xyz', '.top', '.club', '.online', '.site', '.tech',
+                       '.store', '.app', '.buzz', '.icu', '.cam', '.loan',
+                       '.racing', '.review', '.stream', '.download', '.gdn',
+                       '.men', '.party', '.science', '.trade', '.win',
+                       '.bid', '.cc', '.ru', '.cn', '.su']
+    for tld in suspicious_tlds:
+        if domain_lower.endswith(tld):
+            findings.append({
+                "type": "suspicious_tld",
+                "severity": "MEDIUM",
+                "detail": f"Suspicious TLD: {tld} (commonly used in phishing)",
+            })
+            break
+
+    return findings
+
+
+def analyze_sender_domain(headers: dict) -> List[dict]:
+    """Analyze sender domain for homoglyph/lookalike attacks."""
+    findings = []
+
+    from_parsed = headers.get("from_parsed", {})
+    reply_to_parsed = headers.get("reply_to_parsed", {})
+    return_path_parsed = headers.get("return_path_parsed", {})
+
+    from_domain = from_parsed.get("address", "").split("@")[-1] if from_parsed.get("address") else ""
+    reply_to_domain = reply_to_parsed.get("address", "").split("@")[-1] if reply_to_parsed.get("address") else ""
+    return_path_domain = return_path_parsed.get("address", "").split("@")[-1] if return_path_parsed.get("address") else ""
+
+    # Check From domain
+    if from_domain:
+        findings.extend(detect_homoglyphs(from_domain))
+
+    # Check Reply-To domain
+    if reply_to_domain and reply_to_domain != from_domain:
+        findings.extend(detect_homoglyphs(reply_to_domain))
+
+    # Check Return-Path domain
+    if return_path_domain and return_path_domain != from_domain:
+        findings.extend(detect_homoglyphs(return_path_domain))
+
+    # Cross-domain comparison (From vs Reply-To)
+    if from_domain and reply_to_domain and from_domain != reply_to_domain:
+        # Check if they look similar (Levenshtein-like check)
+        if _domains_look_similar(from_domain, reply_to_domain):
+            findings.append({
+                "type": "similar_reply_to",
+                "severity": "HIGH",
+                "detail": f"Reply-To domain '{reply_to_domain}' looks similar to From domain '{from_domain}'",
+            })
+
+    return findings
+
+
+def _domains_look_similar(domain1: str, domain2: str) -> bool:
+    """Check if two domains look suspiciously similar."""
+    d1 = domain1.lower().split('.')[0]
+    d2 = domain2.lower().split('.')[0]
+
+    # Simple Levenshtein distance check
+    if len(d1) < 3 or len(d2) < 3:
+        return False
+
+    # Check if one contains the other
+    if d1 in d2 or d2 in d1:
+        return True
+
+    # Check character-by-character similarity
+    if len(d1) == len(d2):
+        diff_count = sum(1 for a, b in zip(d1, d2) if a != b)
+        if diff_count <= 2:
+            return True
+
+    return False

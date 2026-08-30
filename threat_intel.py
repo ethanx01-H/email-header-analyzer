@@ -8,14 +8,66 @@ network errors return "ERROR", never crash the tool.
 
 import hashlib
 import json
+import os
 import socket
 import ssl
+import time
 import urllib.request
 import urllib.parse
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Optional
 
 from config import load_config
+
+# Cache file for IOC results (avoids re-querying same IOCs)
+CACHE_DIR = Path(__file__).parent / ".cache"
+CACHE_FILE = CACHE_DIR / "ioc_cache.json"
+CACHE_TTL = 86400  # 24 hours
+
+
+# ──────────────────────────────────────────────
+#  CACHE MANAGEMENT
+# ──────────────────────────────────────────────
+
+def _load_cache() -> dict:
+    """Load IOC cache from disk."""
+    if not CACHE_FILE.exists():
+        return {}
+    try:
+        with open(CACHE_FILE, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return {}
+
+
+def _save_cache(cache: dict):
+    """Save IOC cache to disk."""
+    try:
+        CACHE_DIR.mkdir(exist_ok=True)
+        with open(CACHE_FILE, "w") as f:
+            json.dump(cache, f, indent=2)
+    except IOError:
+        pass
+
+
+def _get_cached(cache: dict, key: str) -> Optional[dict]:
+    """Get cached result if not expired."""
+    entry = cache.get(key)
+    if not entry:
+        return None
+    if time.time() - entry.get("timestamp", 0) > CACHE_TTL:
+        return None
+    return entry.get("data")
+
+
+def _set_cached(cache: dict, key: str, data: dict):
+    """Store result in cache."""
+    cache[key] = {
+        "timestamp": time.time(),
+        "data": data,
+    }
 
 
 # ──────────────────────────────────────────────
@@ -23,11 +75,15 @@ from config import load_config
 # ──────────────────────────────────────────────
 
 def enrich_iocs(iocs: dict) -> dict:
-    """Enrich all extracted IOCs with threat intelligence."""
+    """Enrich all extracted IOCs with threat intelligence (parallel execution)."""
     config = load_config()
     timeout = config.get("request_timeout", 10)
     max_per_source = config.get("max_iocs_per_source", 10)
     abusech_key = config.get("abusech_auth_key", "")
+    max_workers = config.get("max_workers", 8)
+
+    # Load cache
+    cache = _load_cache()
 
     results = {
         "ip_results": {},
@@ -48,58 +104,70 @@ def enrich_iocs(iocs: dict) -> dict:
     if config.get("dns_lookups_enabled", True):
         results["dns_results"] = _enrich_dns(iocs, timeout)
 
-    # --- Enrich public IPs ---
+    # Build task list for parallel execution
+    tasks = []
+
+    # Public IPs
     public_ips = iocs.get("public_ips", [])[:max_per_source]
     for ip in public_ips:
-        ip_result = {}
+        cache_key = f"ip:{ip}"
+        cached = _get_cached(cache, cache_key)
+        if cached:
+            results["ip_results"][ip] = cached
+            _update_summary(results["summary"], cached)
+        else:
+            tasks.append(("ip", ip, ip))
 
-        # VirusTotal
-        if config.get("virustotal_api_key"):
-            ip_result["virustotal"] = _vt_check_ip(ip, config["virustotal_api_key"], timeout)
-
-        # AbuseIPDB
-        if config.get("abuseipdb_api_key"):
-            ip_result["abuseipdb"] = _abuseipdb_check_ip(ip, config["abuseipdb_api_key"], timeout)
-
-        # Reverse DNS
-        ip_result["reverse_dns"] = _reverse_dns(ip, timeout)
-
-        results["ip_results"][ip] = ip_result
-        _update_summary(results["summary"], ip_result)
-
-    # --- Enrich domains ---
+    # Domains
     domains = iocs.get("domains", [])[:max_per_source]
     for domain in domains:
-        domain_result = {}
+        cache_key = f"domain:{domain}"
+        cached = _get_cached(cache, cache_key)
+        if cached:
+            results["domain_results"][domain] = cached
+            _update_summary(results["summary"], cached)
+        else:
+            tasks.append(("domain", domain, domain))
 
-        if config.get("virustotal_api_key"):
-            domain_result["virustotal"] = _vt_check_domain(domain, config["virustotal_api_key"], timeout)
-
-        # URLhaus domain check
-        if config.get("urlhaus_enabled", True) and abusech_key:
-            domain_result["urlhaus"] = _urlhaus_check_host(domain, abusech_key, timeout)
-        elif config.get("urlhaus_enabled", True):
-            domain_result["urlhaus"] = {"source": "URLhaus", "status": "NOT CONFIGURED", "error": "No abuse.ch Auth-Key (get free at auth.abuse.ch)"}
-
-        results["domain_results"][domain] = domain_result
-        _update_summary(results["summary"], domain_result)
-
-    # --- Enrich URLs ---
+    # URLs
     urls = iocs.get("urls", [])[:max_per_source]
     for url in urls:
-        url_result = {}
+        cache_key = f"url:{hashlib.md5(url.encode()).hexdigest()}"
+        cached = _get_cached(cache, cache_key)
+        if cached:
+            results["url_results"][url] = cached
+            _update_summary(results["summary"], cached)
+        else:
+            tasks.append(("url", url, url))
 
-        if config.get("virustotal_api_key"):
-            url_result["virustotal"] = _vt_check_url(url, config["virustotal_api_key"], timeout)
+    # Execute enrichment tasks in parallel
+    if tasks:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {}
+            for task_type, ioc_value, _ in tasks:
+                if task_type == "ip":
+                    futures[executor.submit(_enrich_ip, ioc_value, config, timeout)] = ("ip", ioc_value)
+                elif task_type == "domain":
+                    futures[executor.submit(_enrich_domain, ioc_value, config, timeout, abusech_key)] = ("domain", ioc_value)
+                elif task_type == "url":
+                    futures[executor.submit(_enrich_url, ioc_value, config, timeout, abusech_key)] = ("url", ioc_value)
 
-        # URLhaus URL check
-        if config.get("urlhaus_enabled", True) and abusech_key:
-            url_result["urlhaus"] = _urlhaus_check_url(url, abusech_key, timeout)
-        elif config.get("urlhaus_enabled", True):
-            url_result["urlhaus"] = {"source": "URLhaus", "status": "NOT CONFIGURED", "error": "No abuse.ch Auth-Key"}
-
-        results["url_results"][url] = url_result
-        _update_summary(results["summary"], url_result)
+            for future in as_completed(futures):
+                task_type, ioc_value = futures[future]
+                try:
+                    result = future.result()
+                    if task_type == "ip":
+                        results["ip_results"][ioc_value] = result
+                        _set_cached(cache, f"ip:{ioc_value}", result)
+                    elif task_type == "domain":
+                        results["domain_results"][ioc_value] = result
+                        _set_cached(cache, f"domain:{ioc_value}", result)
+                    elif task_type == "url":
+                        results["url_results"][ioc_value] = result
+                        _set_cached(cache, f"url:{hashlib.md5(ioc_value.encode()).hexdigest()}", result)
+                    _update_summary(results["summary"], result)
+                except Exception:
+                    pass
 
     # --- ThreatFox IOC check (bulk) ---
     if config.get("threatfox_enabled", True) and abusech_key:
@@ -112,7 +180,45 @@ def enrich_iocs(iocs: dict) -> dict:
                     if entry.get("malicious"):
                         results["summary"]["malicious"] += 1
 
+    # Save cache
+    _save_cache(cache)
+
     return results
+
+
+def _enrich_ip(ip: str, config: dict, timeout: int) -> dict:
+    """Enrich a single IP (all sources)."""
+    result = {}
+    if config.get("virustotal_api_key"):
+        result["virustotal"] = _vt_check_ip(ip, config["virustotal_api_key"], timeout)
+    if config.get("abuseipdb_api_key"):
+        result["abuseipdb"] = _abuseipdb_check_ip(ip, config["abuseipdb_api_key"], timeout)
+    result["reverse_dns"] = _reverse_dns(ip, timeout)
+    return result
+
+
+def _enrich_domain(domain: str, config: dict, timeout: int, abusech_key: str) -> dict:
+    """Enrich a single domain (all sources)."""
+    result = {}
+    if config.get("virustotal_api_key"):
+        result["virustotal"] = _vt_check_domain(domain, config["virustotal_api_key"], timeout)
+    if config.get("urlhaus_enabled", True) and abusech_key:
+        result["urlhaus"] = _urlhaus_check_host(domain, abusech_key, timeout)
+    elif config.get("urlhaus_enabled", True):
+        result["urlhaus"] = {"source": "URLhaus", "status": "NOT CONFIGURED", "error": "No abuse.ch Auth-Key"}
+    return result
+
+
+def _enrich_url(url: str, config: dict, timeout: int, abusech_key: str) -> dict:
+    """Enrich a single URL (all sources)."""
+    result = {}
+    if config.get("virustotal_api_key"):
+        result["virustotal"] = _vt_check_url(url, config["virustotal_api_key"], timeout)
+    if config.get("urlhaus_enabled", True) and abusech_key:
+        result["urlhaus"] = _urlhaus_check_url(url, abusech_key, timeout)
+    elif config.get("urlhaus_enabled", True):
+        result["urlhaus"] = {"source": "URLhaus", "status": "NOT CONFIGURED", "error": "No abuse.ch Auth-Key"}
+    return result
 
 
 # ──────────────────────────────────────────────
@@ -398,42 +504,48 @@ def _urlhaus_check_host(host: str, auth_key: str, timeout: int) -> dict:
 # ──────────────────────────────────────────────
 
 def _threatfox_bulk_check(iocs_list: list, auth_key: str, timeout: int) -> list:
-    """Check IOCs against ThreatFox in bulk."""
+    """Check IOCs against ThreatFox individually (API only supports single IOC queries)."""
     results = []
+    seen_iocs = set()
 
-    try:
-        post_data = json.dumps({
-            "query": "search_ioc",
-            "search_term": " ".join(iocs_list[:5]),
-        }).encode()
+    for ioc in iocs_list[:5]:  # Limit to 5 to avoid rate limiting
+        if ioc in seen_iocs:
+            continue
+        seen_iocs.add(ioc)
 
-        req = urllib.request.Request(
-            "https://threatfox-api.abuse.ch/api/v1/",
-            data=post_data,
-            headers={
-                "Content-Type": "application/json",
-                "Auth-Key": auth_key,
-            },
-        )
-        ctx = ssl.create_default_context()
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-            data = json.loads(resp.read().decode())
+        try:
+            post_data = json.dumps({
+                "query": "search_ioc",
+                "search_term": ioc,
+            }).encode()
 
-        if data.get("query_status") == "ok":
-            for ioc_entry in data.get("data", []):
-                results.append({
-                    "ioc": ioc_entry.get("ioc", ""),
-                    "threat_type": ioc_entry.get("threat_type", ""),
-                    "malware": ioc_entry.get("malware", ""),
-                    "confidence": ioc_entry.get("confidence_level", 0),
-                    "first_seen": ioc_entry.get("first_seen_utc", ""),
-                    "last_seen": ioc_entry.get("last_seen_utc", ""),
-                    "malicious": True,
-                    "source": "ThreatFox",
-                })
+            req = urllib.request.Request(
+                "https://threatfox-api.abuse.ch/api/v1/",
+                data=post_data,
+                headers={
+                    "Content-Type": "application/json",
+                    "Auth-Key": auth_key,
+                },
+            )
+            ctx = ssl.create_default_context()
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                data = json.loads(resp.read().decode())
 
-    except Exception:
-        pass  # ThreatFox is optional, don't break on failure
+            if data.get("query_status") == "ok" and data.get("data"):
+                for ioc_entry in data["data"]:
+                    results.append({
+                        "ioc": ioc_entry.get("ioc", ""),
+                        "threat_type": ioc_entry.get("threat_type", ""),
+                        "malware": ioc_entry.get("malware", ""),
+                        "confidence": ioc_entry.get("confidence_level", 0),
+                        "first_seen": ioc_entry.get("first_seen_utc", ""),
+                        "last_seen": ioc_entry.get("last_seen_utc", ""),
+                        "malicious": True,
+                        "source": "ThreatFox",
+                    })
+
+        except Exception:
+            continue  # ThreatFox is optional, don't break on failure
 
     return results
 

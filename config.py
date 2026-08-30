@@ -21,6 +21,8 @@ DEFAULT_CONFIG = {
     "dns_lookups_enabled": True,
     "max_iocs_per_source": 10,
     "request_timeout": 10,
+    "max_workers": 8,              # Parallel enrichment threads
+    "cache_enabled": True,         # Cache IOC results
 }
 
 

@@ -1,1 +1,2 @@
 python>=3.8
+pyyaml>=5.0
